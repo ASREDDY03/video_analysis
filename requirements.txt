@@ -1,0 +1,13 @@
+opencv-python
+openai-whisper
+torch
+numpy
+streamlit
+deepface
+ultralytics
+scenedetect
+sumy  
+srt
+imageio[ffmpeg]
+tensorflow==2.16.2  # Latest stable version from your available list
+tf-keras  # Required for DeepFace & RetinaFace
