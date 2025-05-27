@@ -9,10 +9,9 @@ nlp = spacy.load("en_core_web_sm")
 def detect_language(text):
     """Detects the language of a given text."""
     try:
-        return detect(text)  # Returns language code (e.g., 'en', 'fr', 'es')
+        return detect(text)  
     except:
-        return "unknown"  # If detection fails, return 'unknown'
-
+        return "unknown" 
 class CustomTokenizer:
     """Custom tokenizer for Sumy that uses SpaCy instead of NLTK."""
     def __init__(self, language):
