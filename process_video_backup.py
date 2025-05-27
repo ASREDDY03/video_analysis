@@ -1,143 +1,191 @@
-import cv2
-import torch
-import numpy as np
-import srt
-from deepface import DeepFace
-from ultralytics import YOLO
-from scenedetect import VideoManager, SceneManager
-from scenedetect.detectors import ContentDetector
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lsa import LsaSummarizer
-from transformers import pipeline
-from datetime import timedelta
 import os
+import cv2
+import pandas as pd
+from collections import Counter
+from ultralytics import YOLO
+from text_summarization import summarize_text
+from object_tracking import run_object_tracking
+from emotion_detection import detect_emotion
+from deepface import DeepFace
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
-# Set Hugging Face API Token (Replace with your actual token)
-HF_TOKEN = "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"
+DEBUG_DIR = "debug_frames"
+os.makedirs(DEBUG_DIR, exist_ok=True)
+os.makedirs("debug_outputs", exist_ok=True)
 
-HF_MIRROR = "https://huggingface.co/datasets"
-whisper_model = pipeline(
-    "automatic-speech-recognition",
-    model="openai/whisper-large",
-    token=HF_TOKEN,
-    device=0 if torch.cuda.is_available() else -1
-)
-
-
-# Load YOLOv8 for object detection
+# Load YOLOv8 model
 yolo_model = YOLO("yolov8n.pt")
+BATCH_SIZE = 16
+SIMILARITY_THRESHOLD = 0.4
+CROWD_THRESHOLD = 5
 
-# Function to Extract Speech and Convert to Text, also save as SRT
-def extract_speech(video_path, srt_output_path="output.srt"):
-    try:
-        result = whisper_model(video_path)
-        transcript = result["text"]
+# Initialize known characters list
+known_characters = []
+character_id_counter = 1
 
-        # Convert to SRT format
-        subtitles = []
-        words = transcript.split()
-        start_time = timedelta(seconds=0)
-        duration = timedelta(seconds=3)  # Approximate per subtitle
-        for index, word in enumerate(words):
-            end_time = start_time + duration
-            subtitles.append(srt.Subtitle(index, start_time, end_time, word))
-            start_time = end_time  # Move start time forward
+def flatten_list(nested_list):
+    flat_list = []
+    for item in nested_list:
+        if isinstance(item, list):
+            flat_list.extend(flatten_list(item))
+        elif isinstance(item, (str, int, float)):
+            flat_list.append(str(item))
+    return flat_list
 
-        # Save SRT file
-        with open(srt_output_path, "w", encoding="utf-8") as f:
-            f.write(srt.compose(subtitles))
+def assign_scene_id(frame_time_sec, scene_seconds):
+    for i, (start, end) in enumerate(scene_seconds, start=1):
+        if start <= frame_time_sec <= end:
+            return i
+    return None
 
-        return transcript, srt_output_path
+def process_video(video_path, scene_changes, segments, transcript, srt_file_path, audio_debug_file):
+    global known_characters, character_id_counter
 
-    except Exception as e:
-        print(f"Error in speech extraction: {e}")
-        return "", None
+    if not os.path.exists(video_path):
+        return {"error": "Video file not found!"}
 
-# Function to Read and Process an Existing SRT File
-def extract_srt(srt_path):
-    try:
-        with open(srt_path, "r", encoding="utf-8") as f:
-            subtitles = list(srt.parse(f.read()))
-        return " ".join([sub.content for sub in subtitles])
-    except Exception as e:
-        print(f"Error reading SRT file: {e}")
-        return ""
-
-# Function for Scene Segmentation
-def segment_scenes(video_path):
-    video_manager = VideoManager([video_path])
-    scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector())
-    
-    video_manager.set_downscale_factor()
-    video_manager.start()
-    
-    scene_manager.detect_scenes(frame_source=video_manager)
-    scene_list = scene_manager.get_scene_list()
-    return [(start.get_timecode(), end.get_timecode()) for start, end in scene_list]
-
-# Function for Object Detection
-def detect_objects(frame):
-    
-    results = yolo_model(frame)
-    object_data = results[0].boxes.data.tolist()  # Extract detected objects
-    return object_data  # List of detected objects
-
-# Function for Facial Emotion Detection
-def detect_emotion(frame):
-    try:
-        emotions = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False)
-        return emotions[0]['dominant_emotion'] if emotions else "No face detected"
-    except Exception as e:
-        print(f"Error in emotion detection: {e}")
-        return "Error"
-
-# Function for Text Summarization
-def summarize_text(text):
-    if not text:
-        return "No speech detected."
-    parser = PlaintextParser.from_string(text, Tokenizer("english"))
-    summarizer = LsaSummarizer()
-    summary = summarizer(parser.document, 3)  # Extract top 3 sentences
-    return " ".join([str(sentence) for sentence in summary])
-
-# Function to Process Video
-def process_video(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"error": "Unable to open video file."}
 
     frame_count = 0
-    transcript, srt_file = extract_speech(video_path)
-    scene_changes = segment_scenes(video_path)
-    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    print(f"\n🎥 Processing Video: {video_path} | FPS: {fps} | Total Frames: {total_frames}")
+
+    # Pre-compute scene seconds
+    scene_seconds = []
+    for start, end in scene_changes:
+        h1, m1, s1 = start.split(":")
+        h2, m2, s2 = end.split(":")
+        start_sec = int(h1) * 3600 + int(m1) * 60 + float(s1)
+        end_sec = int(h2) * 3600 + int(m2) * 60 + float(s2)
+        scene_seconds.append((start_sec, end_sec))
+
+    run_object_tracking(video_path)
+
     frame_analysis = []
-    
+    frame_buffer = []
+    timestamps = []
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_count % 10 == 0:  # Process every 10th frame for performance
-            object_results = detect_objects(frame)
-            emotion_result = detect_emotion(frame)
+        frame_time_sec = int(frame_count / fps)
+        frame_buffer.append(frame)
+        timestamps.append(frame_time_sec)
 
-            frame_analysis.append({
-                "frame": frame_count,
-                "objects_detected": len(object_results),
-                "facial_emotion": emotion_result
-            })
+        if len(frame_buffer) == BATCH_SIZE or frame_count == total_frames - 1:
+            results = yolo_model(frame_buffer)
+
+            for i, result in enumerate(results):
+                class_ids = result.boxes.cls.tolist() if hasattr(result, 'boxes') else []
+                object_names = [result.names[int(cls)] for cls in class_ids]
+                flattened_objects = flatten_list(object_names)
+                object_text = ", ".join(flattened_objects) if flattened_objects else "None"
+
+                emotion_result = detect_emotion(frame_buffer[i]) if i % 3 == 0 else ""
+                emotion_text = str(emotion_result) if isinstance(emotion_result, str) else "Neutral"
+
+                
+                # Character tracking
+                try:
+                    faces = DeepFace.analyze(frame_buffer[i], actions=["embedding"], enforce_detection=False)
+                    if not isinstance(faces, list):
+                        faces = [faces]
+
+                    detected_ids = []
+                    for face in faces:
+                        embedding = face.get("embedding")
+                        if embedding is None:
+                            continue
+
+                        matched = False
+                        for known in known_characters:
+                            similarity = cosine_similarity([embedding], [known["embedding"]])[0][0]
+                            if similarity >= SIMILARITY_THRESHOLD:
+                                detected_ids.append(known["id"])
+                                matched = True
+                                break
+
+                        if not matched:
+                            new_id = f"Person_{character_id_counter}"
+                            character_id_counter += 1
+                            known_characters.append({"id": new_id, "embedding": embedding})
+                            detected_ids.append(new_id)
+
+                    character_label = ", ".join(detected_ids) if len(detected_ids) < CROWD_THRESHOLD else "Crowd"
+
+                except Exception as e:
+                    character_label = "Detection Failed"
+
+
+                frame_filename = f"{DEBUG_DIR}/frame_{timestamps[i]}s.jpg"
+                frame = frame_buffer[i]
+                cv2.putText(frame, f"Objects: {object_text}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.putText(frame, f"Emotion: {emotion_text}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                cv2.putText(frame, f"Characters: {character_label}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                cv2.imwrite(frame_filename, frame)
+
+                scene_id = assign_scene_id(timestamps[i], scene_seconds)
+
+                frame_analysis.append({
+                    "frame_time_sec": timestamps[i],
+                    "scene_id": scene_id,
+                    "objects_detected": object_text,
+                    "facial_emotion": emotion_text,
+                    "frame_image": frame_filename,
+                    "characters": character_label
+                })
+
+            frame_buffer.clear()
+            timestamps.clear()
 
         frame_count += 1
 
     cap.release()
 
-    summary = summarize_text(transcript)
+    # Aggregate per scene
+    scene_summary = []
+    for idx, (start, end) in enumerate(scene_seconds, start=1):
+        scene_frames = [f for f in frame_analysis if start <= f["frame_time_sec"] <= end]
+        obj_counter = Counter()
+        emo_counter = Counter()
+        for f in scene_frames:
+            obj_counter.update(f["objects_detected"].split(", "))
+            if f["facial_emotion"]:
+                emo_counter[f["facial_emotion"]] += 1
+
+        top_ids = [obj for obj, _ in obj_counter.most_common(3)]
+        top_objects = ", ".join(top_ids)
+        dominant_emotion = emo_counter.most_common(1)[0][0] if emo_counter else "Unknown"
+
+        scene_text = " ".join(seg["text"] for seg in segments if start <= seg["start"] <= end) or "No speech in this scene."
+        summary = summarize_text(scene_text)
+
+        scene_summary.append({
+            "scene_start": start,
+            "scene_end": end,
+            "top_objects": top_objects,
+            "emotion": dominant_emotion,
+            "summary": summary
+        })
+
+    scene_df = pd.DataFrame(scene_summary)
+    frame_df = pd.DataFrame(frame_analysis)
+    #character_df = frame_df[["frame_time_sec", "scene_id", "characters"]]
+    #character_df.to_csv("debug_outputs/character_tracking_log.csv", index=False)
 
     return {
-        "speech_summary": summary,
+        "speech_summary": summarize_text(transcript) if transcript else "No speech detected.",
+        "transcription": transcript,
+        "srt_file": srt_file_path,
         "scene_changes": scene_changes,
-        "frame_analysis": frame_analysis,
-        "srt_file": srt_file
+        "frame_analysis": frame_df,
+        "scene_analysis": scene_df,
+        "audio_debug_file": audio_debug_file,
+        "debug_frames": frame_analysis
     }
